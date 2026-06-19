@@ -5,6 +5,7 @@ description = "An AI assisted terminal for learning and productivity"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "openai>=1.0.0",
     "pyte>=0.8.0",
     "textual>=8.2.7",
 ]

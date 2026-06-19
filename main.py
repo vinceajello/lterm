@@ -12,6 +12,8 @@ import struct
 import tempfile
 import termios
 import threading
+import time
+from collections import deque
 from datetime import datetime
 from typing import Optional
 
@@ -23,7 +25,10 @@ from textual.app import App, ComposeResult
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widget import Widget
-from textual.widgets import Label, RichLog
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Label, RichLog, Static
+
+from agent import ask as agent_ask, ask_error as agent_ask_error, generate_suggestions
 
 
 # Strips ANSI/VT escape sequences from raw bytes
@@ -63,6 +68,9 @@ export PROMPT_COMMAND
 
 PS0=$'\033]9998;\007'
 export PS0
+
+# Silent history reload triggered by lterm via SIGUSR1
+trap 'history -r' SIGUSR1
 """
 
 
@@ -154,6 +162,7 @@ class StatusHeader(Widget):
 
     DEFAULT_CSS = """
     StatusHeader {
+        dock: top;
         height: 1;
         background: #1c1c2e;
         color: #cdd6f4;
@@ -184,6 +193,35 @@ class StatusHeader(Widget):
         self.query_one("#clock", Label).update(datetime.now().strftime("%H:%M:%S"))
 
 
+class ScrollbackScreen(pyte.Screen):
+    """pyte.Screen extended with a scrollback history buffer."""
+
+    def __init__(self, cols: int, rows: int, history_size: int = 5000) -> None:
+        super().__init__(cols, rows)
+        self._history: deque[dict] = deque(maxlen=history_size)
+        self._in_alt_screen: bool = False
+
+    def set_mode(self, *modes: int, **kwargs) -> None:  # type: ignore[override]
+        super().set_mode(*modes, **kwargs)
+        if kwargs.get("private") and 1049 in modes:
+            self._in_alt_screen = True
+
+    def reset_mode(self, *modes: int, **kwargs) -> None:  # type: ignore[override]
+        super().reset_mode(*modes, **kwargs)
+        if kwargs.get("private") and 1049 in modes:
+            self._in_alt_screen = False
+
+    def index(self) -> None:
+        # self.margins is None when no explicit scroll region is set.
+        margins = self.margins
+        top, bottom = margins if margins is not None else (0, self.lines - 1)
+        # Only save when the screen is actually about to scroll (cursor at bottom)
+        # and the scroll region starts at row 0 (main screen, not a sub-region).
+        if not self._in_alt_screen and top == 0 and self.cursor.y == bottom:
+            self._history.append(dict(self.buffer[top]))
+        super().index()
+
+
 class TerminalView(Widget):
     """An embedded VT100 terminal emulator widget powered by pyte."""
 
@@ -204,10 +242,18 @@ class TerminalView(Widget):
             self.command = command
             self.output = output
 
+    class AgentQueried(Message):
+        """Posted when the user submits a -- query for the agent."""
+        def __init__(self, prompt: str, context: str) -> None:
+            super().__init__()
+            self.prompt = prompt
+            self.context = context
+
     DEFAULT_CSS = """
     TerminalView {
         width: 1fr;
         height: 1fr;
+        min-height: 5;
         background: #000000;
         color: #ffffff;
     }
@@ -230,6 +276,13 @@ class TerminalView(Widget):
         self._output_buf = bytearray()
         self._capturing = False
         self._command_started = False  # True once PS0 (OSC 9998) has fired
+        # Line buffer for -- agent interception
+        self._line_buf: str = ""
+        self._last_context: str = ""  # filled by CommandExecuted
+        # Track PTY size to avoid unnecessary pyte screen truncation
+        self._pty_cols: int = 0
+        self._pty_rows: int = 0
+        self._scroll_offset: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -264,7 +317,7 @@ class TerminalView(Widget):
     # ------------------------------------------------------------------
 
     def _start_shell(self, cols: int, rows: int) -> None:
-        self._screen = pyte.Screen(cols, rows)
+        self._screen = ScrollbackScreen(cols, rows)
         self._stream = pyte.ByteStream(self._screen)
 
         # Write shell integration rcfile
@@ -295,6 +348,7 @@ class TerminalView(Widget):
 
         # parent
         self._resize_pty(cols, rows)
+        self._pty_cols, self._pty_rows = cols, rows
         self._running = True
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
@@ -317,6 +371,7 @@ class TerminalView(Widget):
                         break
                     pyte_data = self._process_raw(data)
                     self._stream.feed(pyte_data)
+                    self._scroll_offset = 0  # new output → snap to live
                     self.app.call_from_thread(self.refresh)
             except OSError:
                 break
@@ -430,6 +485,11 @@ class TerminalView(Widget):
             .replace("\r", "")
             .strip()
         )
+        # Keep context for the next agent query
+        self._last_context = (
+            f"User: {user}\nCwd: {cwd}\nLast command: {command}\n"
+            + (f"Output:\n{clean_out}" if clean_out else "")
+        )
         self.app.call_from_thread(
             self.post_message,
             TerminalView.CommandExecuted(exit_code, user, cwd, command, clean_out),
@@ -441,6 +501,7 @@ class TerminalView(Widget):
 
     def on_resize(self, event: events.Resize) -> None:
         cols, rows = event.size.width, event.size.height
+        self._pty_cols, self._pty_rows = cols, rows
         if self._screen is not None:
             self._screen.resize(rows, cols)
         self._resize_pty(cols, rows)
@@ -448,6 +509,65 @@ class TerminalView(Widget):
     def on_key(self, event: events.Key) -> None:
         if self._fd is None or not self._running:
             return
+
+        # Scrollback navigation — Shift+Up/Down scroll one line,
+        # Shift+PageUp/Down scroll half a screen.  Any other key snaps to live.
+        if event.key in ("shift+up", "shift+down", "shift+pageup", "shift+pagedown"):
+            screen = self._screen
+            if isinstance(screen, ScrollbackScreen):
+                history_len = len(screen._history)
+                rows = screen.lines
+                half = max(rows // 2, 1)
+                if event.key == "shift+up":
+                    self._scroll_offset = min(self._scroll_offset + 1, history_len)
+                elif event.key == "shift+down":
+                    self._scroll_offset = max(self._scroll_offset - 1, 0)
+                elif event.key == "shift+pageup":
+                    self._scroll_offset = min(self._scroll_offset + half, history_len)
+                elif event.key == "shift+pagedown":
+                    self._scroll_offset = max(self._scroll_offset - half, 0)
+            self.refresh()
+            event.stop()
+            event.prevent_default()
+            return
+
+        # Any other key → snap back to the live view
+        self._scroll_offset = 0
+
+        # --- Agent interception: buffer printable chars to detect -- prefix ---
+        if event.character and event.key not in _SPECIAL_KEYS:
+            self._line_buf += event.character
+        elif event.key == "backspace":
+            self._line_buf = self._line_buf[:-1]
+        elif event.key == "enter":
+            line = self._line_buf.strip()
+            self._line_buf = ""
+            if line.startswith("--"):
+                prompt = line[2:].strip()
+                if prompt:
+                    # Erase what the user typed on the PTY line, then newline
+                    # so the shell returns to a clean prompt
+                    try:
+                        os.write(self._fd, b"\x15\n")
+                    except OSError:
+                        pass
+                    # Write directly to ~/.bash_history
+                    history_file = os.path.expanduser("~/.bash_history")
+                    try:
+                        with open(history_file, "a") as hf:
+                            hf.write(f"-- {prompt}\n")
+                        # Signal bash to silently reload history (trap 'history -r' SIGUSR1)
+                        if self._pid is not None:
+                            os.kill(self._pid, signal.SIGUSR1)
+                    except OSError:
+                        pass
+                    self.post_message(
+                        TerminalView.AgentQueried(prompt, self._last_context)
+                    )
+                    event.stop()
+                    event.prevent_default()
+                    return
+        # ---------------------------------------------------------------
 
         data: Optional[bytes] = _SPECIAL_KEYS.get(event.key)
         if data is None and event.character:
@@ -485,23 +605,46 @@ class TerminalView(Widget):
 
         screen = self._screen
         result = Text(end="", no_wrap=True, overflow="fold")
+        offset = self._scroll_offset
 
-        for row in range(screen.lines):
-            row_buf = screen.buffer[row]
-            for col in range(screen.columns):
-                char = row_buf[col]
-                style = self._char_style(char)
-                # Render cursor as a reverse-video block
-                if row == screen.cursor.y and col == screen.cursor.x:
-                    style = style + Style(reverse=True)
-                result.append(char.data, style=style)
-            if row < screen.lines - 1:
-                result.append("\n")
+        if offset > 0 and isinstance(screen, ScrollbackScreen):
+            # Build a virtual viewport: last `offset` history rows + top screen rows
+            history = screen._history
+            num_hist = min(offset, len(history), screen.lines)
+            hist_start = max(len(history) - offset, 0)
+            hist_rows = list(history)[hist_start : hist_start + num_hist]
+            num_screen = screen.lines - num_hist
+
+            all_rows: list[tuple[bool, object]] = (
+                [(True, h) for h in hist_rows]
+                + [(False, screen.buffer[r]) for r in range(num_screen)]
+            )
+            default = screen.default_char
+            for i, (is_hist, row_data) in enumerate(all_rows):
+                for col in range(screen.columns):
+                    if is_hist:
+                        char = row_data.get(col, default)  # type: ignore[union-attr]
+                    else:
+                        char = row_data[col]  # type: ignore[index]
+                    result.append(char.data, self._char_style(char))
+                if i < len(all_rows) - 1:
+                    result.append("\n")
+        else:
+            for row in range(screen.lines):
+                row_buf = screen.buffer[row]
+                for col in range(screen.columns):
+                    char = row_buf[col]
+                    style = self._char_style(char)
+                    if row == screen.cursor.y and col == screen.cursor.x:
+                        style = style + Style(reverse=True)
+                    result.append(char.data, style=style)
+                if row < screen.lines - 1:
+                    result.append("\n")
 
         return result
 
 
-class SuggestionButton(Widget):
+class SuggestionButton(Static):
     """A static clickable chip — no animations, no transitions."""
 
     DEFAULT_CSS = """
@@ -509,7 +652,6 @@ class SuggestionButton(Widget):
         height: 1;
         width: auto;
         margin: 0 1 0 0;
-        margin-left: 1;
         padding: 0 1;
         background: #313244;
         color: #cdd6f4;
@@ -523,15 +665,13 @@ class SuggestionButton(Widget):
     can_focus = False
 
     def __init__(self, text: str, **kwargs) -> None:
-        super().__init__(**kwargs)
+        super().__init__(text, **kwargs)
         self._text = text
-
-    def render(self) -> Text:
-        return Text(self._text, style=Style(color="#cdd6f4", bgcolor="#313244"))
 
     def on_click(self, event: events.Click) -> None:
         self.post_message(SuggestionBar.Pressed(self._text))
-        bar = self.parent
+        row = self.parent
+        bar = row.parent if row is not None else None
         self.remove()
         if bar is not None:
             bar.call_after_refresh(bar._check_visibility)
@@ -539,39 +679,72 @@ class SuggestionButton(Widget):
 
 
 class SuggestionBar(Widget):
-    """A horizontal strip of clickable suggestion buttons.
+    """A wrapping bar of clickable suggestion chips.
 
     Public API
     ----------
-    add_suggestion(text)   – append a button with the given text.
-    clear_suggestions()    – remove all buttons.
+    add_suggestion(text)   – append a chip, wrapping to a new row if needed.
+    clear_suggestions()    – remove all chips.
     """
 
     DEFAULT_CSS = """
     SuggestionBar {
-        height: 3;
+        height: auto;
+        max-height: 8;
         background: #1e1e2e;
         border-bottom: solid #313244;
-        layout: horizontal;
-        padding: 1 0 0 0;
-        overflow-x: auto;
-        overflow-y: hidden;
+        layout: vertical;
+        padding: 1 1 0 1;
+        overflow: hidden;
+    }
+    SuggestionBar Horizontal {
+        height: 1;
+        width: 1fr;
+        background: #1e1e2e;
+        margin: 0 0 1 0;
     }
     """
 
     class Pressed(Message):
-        """Posted when a suggestion button is clicked."""
+        """Posted when a suggestion chip is clicked."""
         def __init__(self, text: str) -> None:
             super().__init__()
             self.text = text
 
+    # ------------------------------------------------------------------
+    # Row-packing helpers
+    # ------------------------------------------------------------------
+
+    def _last_row(self) -> Horizontal | None:
+        rows = [c for c in self.children if isinstance(c, Horizontal)]
+        return rows[-1] if rows else None
+
+    def _row_used_width(self, row: Horizontal) -> int:
+        total = 0
+        for btn in row.children:
+            if isinstance(btn, SuggestionButton):
+                total += len(btn._text) + 4  # 2 padding + 1 margin-right + 1 gap
+        return total
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def add_suggestion(self, text: str) -> None:
-        """Append a clickable suggestion button."""
+        """Append a clickable chip, wrapping to a new row when needed."""
         self.display = True
-        self.mount(SuggestionButton(text))
+        btn = SuggestionButton(text)
+        btn_width = len(text) + 4
+        available = max((self.size.width or 80) - 4, 20)
+
+        row = self._last_row()
+        if row is None or self._row_used_width(row) + btn_width > available:
+            row = Horizontal()
+            self.mount(row)
+        row.mount(btn)
 
     def clear_suggestions(self) -> None:
-        """Remove all suggestion buttons."""
+        """Remove all chips and hide the bar."""
         for child in list(self.children):
             child.remove()
         self.display = False
@@ -580,11 +753,15 @@ class SuggestionBar(Widget):
         self.display = False
 
     def on_child_removed(self, event: events.ChildRemoved) -> None:
-        if not self.children:
+        if not list(self.children):
             self.display = False
 
     def _check_visibility(self) -> None:
-        if not self.children:
+        # Remove rows that became empty after a button click
+        for row in list(self.query(Horizontal)):
+            if not list(row.children):
+                row.remove()
+        if not list(self.query(SuggestionButton)):
             self.display = False
 
 
@@ -665,6 +842,10 @@ class TerminalApp(App):
         padding: 0;
         layout: vertical;
     }
+    #bottom-dock {
+        height: auto;
+        width: 1fr;
+    }
     """
     BINDINGS = [
         ("ctrl+q", "quit", "Quit"),
@@ -673,13 +854,14 @@ class TerminalApp(App):
     def compose(self) -> ComposeResult:
         yield StatusHeader()
         yield TerminalView()
-        yield SuggestionBar()
-        yield ResizeHandle()
-        yield BottomPanel()
+        with Vertical(id="bottom-dock"):
+            yield SuggestionBar()
+            yield ResizeHandle()
+            yield BottomPanel()
 
     def on_mount(self) -> None:
-        self.panel.write("Welcome to LTerm! Run a command to see its output here.")
-        self.add_suggestion("echo hello suggestions")
+        self.panel.write("Welcome to LTerm! I'm your terminal learning assistant.")
+        # self.add_suggestion("echo hello suggestions")
 
     @property
     def suggestions(self) -> SuggestionBar:
@@ -707,21 +889,105 @@ class TerminalApp(App):
         """Convenience accessor for the bottom panel."""
         return self.query_one(BottomPanel)
 
+    def on_terminal_view_agent_queried(
+        self, event: TerminalView.AgentQueried
+    ) -> None:
+        """Run the agent query in a background thread and stream into the panel."""
+        panel = self.panel
+        panel.clear()
+        panel.write(f"⟩ {event.prompt}")
+        panel.write("")
+
+        def _run() -> None:
+            buf = ""
+            last_update = 0.0
+            prompt_line = f"⟩ {event.prompt}"
+
+            def _flush() -> None:
+                panel.clear()
+                panel.write(prompt_line)
+                panel.write(buf)
+
+            try:
+                for chunk in agent_ask(event.prompt, context=event.context or None):
+                    buf += chunk
+                    now = time.monotonic()
+                    if now - last_update >= 0.1:
+                        self.call_from_thread(_flush)
+                        last_update = now
+                # Final update to show the complete response
+                self.call_from_thread(_flush)
+                # After streaming completes, generate suggestions from the answer
+                if buf:
+                    try:
+                        suggestions = generate_suggestions(buf)
+                        self.call_from_thread(self.clear_suggestions)
+                        for s in suggestions:
+                            self.call_from_thread(self.add_suggestion, s)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                self.call_from_thread(panel.write, f"[agent error] {exc}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def on_terminal_view_command_executed(
         self, event: TerminalView.CommandExecuted
     ) -> None:
         ok = event.exit_code == 0
-        icon = "✓ OK" if ok else "✗ ERROR"
-        lines = [
-            icon,
-            f"  Current User: {event.user}",
-            f"  Current Dir:  {event.cwd}",
-            f"  Last Command: {event.command}",
-        ]
-        if event.output:
-            lines.append(f"  Output: {event.output}")
-        self.panel.clear()
-        self.panel.write("\n".join(lines))
+        if ok:
+            icon = "✓ OK"
+            lines = [
+                icon,
+                f"  Current User: {event.user}",
+                f"  Current Dir:  {event.cwd}",
+                f"  Last Command: {event.command}",
+            ]
+            if event.output:
+                lines.append(f"  Output: {event.output}")
+            self.panel.clear()
+            self.panel.write("\n".join(lines))
+
+        if not ok:
+            error_info = (
+                f"✗ ERROR\n"
+                f"  Current User: {event.user}\n"
+                f"  Current Dir:  {event.cwd}\n"
+                f"  Last Command: {event.command}\n"
+                + (f"  Output: {event.output}" if event.output else "")
+            )
+            panel = self.panel
+
+            def _run_error() -> None:
+                buf = ""
+                last_update = 0.0
+
+                def _flush() -> None:
+                    panel.clear()
+                    panel.write(buf)
+
+                try:
+                    for chunk in agent_ask_error(error_info):
+                        buf += chunk
+                        now = time.monotonic()
+                        if now - last_update >= 0.1:
+                            self.call_from_thread(_flush)
+                            last_update = now
+                    # Final update to show the complete response
+                    self.call_from_thread(_flush)
+                    if buf:
+                        try:
+                            suggestions = generate_suggestions(buf)
+                            self.call_from_thread(self.clear_suggestions)
+                            for s in suggestions:
+                                self.call_from_thread(self.add_suggestion, s)
+                        except Exception:
+                            pass
+                except Exception:
+                    # Agent unavailable — clear the panel silently
+                    self.call_from_thread(panel.clear)
+
+            threading.Thread(target=_run_error, daemon=True).start()
 
     def action_quit(self) -> None:
         self.exit()
