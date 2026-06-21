@@ -983,9 +983,11 @@ class TerminalApp(App):
                                 self.call_from_thread(self.add_suggestion, s)
                         except Exception:
                             pass
-                except Exception:
-                    # Agent unavailable — clear the panel silently
+                except Exception as exc:
                     self.call_from_thread(panel.clear)
+                    self.call_from_thread(
+                        panel.write, f"[agent unavailable] {exc}"
+                    )
 
             threading.Thread(target=_run_error, daemon=True).start()
 
