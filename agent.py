@@ -33,6 +33,13 @@ Analyze the error output and provide a concise explanation and fix.
 Keep the answer short and textual. Do not use markdown formatting.
 """
 
+_COMMAND_SYSTEM_PROMPT = """\
+You are LTerm, an expert terminal assistant embedded inside a TUI terminal emulator.
+The user prefixed a shell command or expression with '??' to ask for an explanation.
+Explain what the command does, what each flag/argument means, and any important caveats.
+Keep the answer concise and practical. Do not use markdown formatting.
+"""
+
 
 class Suggestions(BaseModel):
     items: list[str]
@@ -85,6 +92,30 @@ def ask(
 
     for event in stream:
         # The Responses API streams ResponseTextDeltaEvent objects
+        if hasattr(event, "delta") and isinstance(event.delta, str):
+            yield event.delta
+        elif hasattr(event, "type") and event.type == "response.output_text.delta":
+            yield event.delta
+
+
+def ask_command(
+    command: str,
+    *,
+    model: str = "gpt-4o-mini",
+    context: str | None = None,
+) -> Iterator[str]:
+    """Stream an explanation of a shell command (triggered by '??')."""
+    client = _client()
+    user_content = command
+    if context:
+        user_content = f"{context}\n\n{command}"
+    stream = client.responses.create(
+        model=model,
+        instructions=_COMMAND_SYSTEM_PROMPT,
+        input=user_content,
+        stream=True,
+    )
+    for event in stream:
         if hasattr(event, "delta") and isinstance(event.delta, str):
             yield event.delta
         elif hasattr(event, "type") and event.type == "response.output_text.delta":

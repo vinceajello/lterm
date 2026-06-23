@@ -28,7 +28,7 @@ from textual.widget import Widget
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Label, RichLog, Static
 
-from agent import ask as agent_ask, ask_error as agent_ask_error, generate_suggestions
+from agent import ask as agent_ask, ask_error as agent_ask_error, ask_command as agent_ask_command, generate_suggestions
 
 
 # Strips ANSI/VT escape sequences from raw bytes
@@ -243,11 +243,12 @@ class TerminalView(Widget):
             self.output = output
 
     class AgentQueried(Message):
-        """Posted when the user submits a -- query for the agent."""
-        def __init__(self, prompt: str, context: str) -> None:
+        """Posted when the user submits a -- or ?? query for the agent."""
+        def __init__(self, prompt: str, context: str, mode: str = "ask") -> None:
             super().__init__()
             self.prompt = prompt
             self.context = context
+            self.mode = mode  # "ask" | "command"
 
     DEFAULT_CSS = """
     TerminalView {
@@ -542,27 +543,28 @@ class TerminalView(Widget):
         elif event.key == "enter":
             line = self._line_buf.strip()
             self._line_buf = ""
-            if line.startswith("--"):
-                prompt = line[2:].strip()
-                if prompt:
-                    # Erase what the user typed on the PTY line, then newline
-                    # so the shell returns to a clean prompt
+            if line.startswith("--") or line.startswith("??"):
+                prefix = line[:2]
+                body = line[2:].strip()
+                if body:
+                    # Ctrl+U erases the typed text. No \n: sending Enter would
+                    # cause bash to print a blank line + PS1 (which may itself
+                    # contain newlines). No SIGUSR1 for the same reason — it
+                    # triggers readline to reprint the full prompt.
                     try:
-                        os.write(self._fd, b"\x15\n")
+                        os.write(self._fd, b"\x15")
                     except OSError:
                         pass
-                    # Write directly to ~/.bash_history
+                    # Persist the entry to ~/.bash_history for future sessions.
                     history_file = os.path.expanduser("~/.bash_history")
                     try:
                         with open(history_file, "a") as hf:
-                            hf.write(f"-- {prompt}\n")
-                        # Signal bash to silently reload history (trap 'history -r' SIGUSR1)
-                        if self._pid is not None:
-                            os.kill(self._pid, signal.SIGUSR1)
+                            hf.write(f"{prefix} {body}\n")
                     except OSError:
                         pass
+                    mode = "command" if prefix == "??" else "ask"
                     self.post_message(
-                        TerminalView.AgentQueried(prompt, self._last_context)
+                        TerminalView.AgentQueried(body, self._last_context, mode=mode)
                     )
                     event.stop()
                     event.prevent_default()
@@ -798,7 +800,7 @@ class ResizeHandle(Widget):
         screen_height = self.app.size.height
         new_height = screen_height - event.screen_y - 1
         new_height = max(3, min(new_height, screen_height - 6))
-        self.app.query_one(BottomPanel).styles.height = new_height
+        self.app.query_one("#bottom-dock").styles.height = new_height
         event.stop()
 
     def on_mouse_up(self, event: events.MouseUp) -> None:
@@ -819,10 +821,9 @@ class BottomPanel(RichLog):
 
     DEFAULT_CSS = """
     BottomPanel {
-        height: 8;
+        height: 1fr;
         background: #11111b;
         color: #cdd6f4;
-        border-top: solid #313244;
         padding: 0 1;
         scrollbar-size-vertical: 1;
     }
@@ -843,7 +844,7 @@ class TerminalApp(App):
         layout: vertical;
     }
     #bottom-dock {
-        height: auto;
+        height: 10;
         width: 1fr;
     }
     """
@@ -855,8 +856,8 @@ class TerminalApp(App):
         yield StatusHeader()
         yield TerminalView()
         with Vertical(id="bottom-dock"):
-            yield SuggestionBar()
             yield ResizeHandle()
+            yield SuggestionBar()
             yield BottomPanel()
 
     def on_mount(self) -> None:
@@ -909,7 +910,12 @@ class TerminalApp(App):
                 panel.write(buf)
 
             try:
-                for chunk in agent_ask(event.prompt, context=event.context or None):
+                stream_fn = (
+                    agent_ask_command
+                    if event.mode == "command"
+                    else agent_ask
+                )
+                for chunk in stream_fn(event.prompt, context=event.context or None):
                     buf += chunk
                     now = time.monotonic()
                     if now - last_update >= 0.1:
