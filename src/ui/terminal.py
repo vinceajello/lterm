@@ -9,6 +9,7 @@ import signal
 import struct
 import termios
 import threading
+from dataclasses import dataclass
 from typing import Optional
 
 import pyte
@@ -24,6 +25,7 @@ _SPECIAL_KEYS: dict[str, bytes] = {
     "enter": b"\r",
     "backspace": b"\x7f",
     "tab": b"\t",
+    "ctrl+u": b"\x15",
     "escape": b"\x1b",
     "up": b"\x1b[A",
     "down": b"\x1b[B",
@@ -35,7 +37,6 @@ _SPECIAL_KEYS: dict[str, bytes] = {
     "pagedown": b"\x1b[6~",
     "delete": b"\x1b[3~",
 }
-
 
 _ANSI_ESCAPE_RE = re.compile(
     rb"\x1b(?:"
@@ -50,16 +51,25 @@ _ANSI_ESCAPE_RE = re.compile(
 
 _LTERM_PROMPT_CMD = (
     r"__lterm_e=$?;"
-    r" __lterm_c=$(HISTTIMEFORMAT='' history 1 | sed 's/^[[:space:]]*[0-9]*[[:space:]]*//');"
-    r" printf '\033]9999;%d\037%s\037%s\037%s\007'"
-    " \"$__lterm_e\" \"$USER\" \"$PWD\" \"$__lterm_c\""
+    r" printf '\033]9999;%d\037%s\037%s\007'"
+    " \"$__lterm_e\" \"$USER\" \"$PWD\""
 )
 _LTERM_PS0 = "\033]9998;\007"
 
 
+@dataclass(slots=True)
+class CommandHandle:
+    handle_id: int
+    command: str
+    output: str = ""
+    exit_code: Optional[int] = None
+    user: str = ""
+    cwd: str = ""
+    started: bool = False
+    completed: bool = False
+
 def _strip_ansi(data: bytes) -> bytes:
     return _ANSI_ESCAPE_RE.sub(b"", data)
-
 
 class ScrollbackScreen(pyte.Screen):
     """pyte.Screen with a scrollback history buffer."""
@@ -74,33 +84,6 @@ class ScrollbackScreen(pyte.Screen):
         if top == 0 and self.cursor.y == bottom:
             self._history.append(dict(self.buffer[top]))
         super().index()
-
-
-# Module-level style cache — reused across all frames
-_style_cache: dict[tuple, Style] = {}
-
-
-def _cached_style(
-    fg: str, bg: str,
-    bold: bool, italics: bool, underscore: bool,
-    blink: bool, reverse: bool, strikethrough: bool,
-) -> Style:
-    key = (fg, bg, bold, italics, underscore, blink, reverse, strikethrough)
-    s = _style_cache.get(key)
-    if s is None:
-        s = Style(
-            color=_resolve_color(fg),
-            bgcolor=_resolve_color(bg),
-            bold=bold,
-            italic=italics,
-            underline=underscore,
-            blink=blink,
-            reverse=reverse,
-            strike=strikethrough,
-        )
-        _style_cache[key] = s
-    return s
-
 
 def _resolve_color(color: str) -> Optional[str]:
     _named = {
@@ -119,19 +102,27 @@ def _resolve_color(color: str) -> Optional[str]:
         return f"color({color})"
     return _named.get(color)
 
-
 class TerminalView(Widget):
     """A bare-minimum VT100 terminal emulator widget powered by pyte."""
 
     class CommandExecuted(Message):
         """Posted when a shell command finishes."""
-        def __init__(self, exit_code: int, user: str, cwd: str, command: str, output: str) -> None:
+        def __init__(self, exit_code: int, user: str, cwd: str, command: str, output: str, intercepted: bool = False) -> None:
             super().__init__()
             self.exit_code = exit_code
             self.user = user
             self.cwd = cwd
             self.command = command
             self.output = output
+            self.intercepted = intercepted
+
+    class AgentQueried(Message):
+        """Posted when the user submits a -- or ?? query for the agent."""
+        def __init__(self, query: str, context: str, mode: str = "ask") -> None:
+            super().__init__()
+            self.query = query
+            self.context = context
+            self.mode = mode
 
     can_focus = True
 
@@ -152,6 +143,166 @@ class TerminalView(Widget):
         self._output_buf = bytearray()
         self._capturing = False
         self._command_started = False
+        self._line_buf = ""
+        self._line_cursor = 0
+        self._history_nav_index: Optional[int] = None
+        self._history_nav_draft = ""
+        self._handles: list[CommandHandle] = []
+        self._pending_handles: deque[CommandHandle] = deque()
+        self._active_handle: Optional[CommandHandle] = None
+        self._next_handle_id = 1
+        self._shell_user = os.environ.get("USER", "")
+        self._shell_cwd = os.getcwd()
+        self._last_context = ""
+
+    def _reset_line_state(self) -> None:
+        self._line_buf = ""
+        self._line_cursor = 0
+        self._reset_history_navigation()
+
+    def _reset_history_navigation(self) -> None:
+        self._history_nav_index = None
+        self._history_nav_draft = ""
+
+    def _insert_input(self, text: str) -> None:
+        self._line_buf = (
+            self._line_buf[: self._line_cursor]
+            + text
+            + self._line_buf[self._line_cursor :]
+        )
+        self._line_cursor += len(text)
+        self._reset_history_navigation()
+
+    def _backspace_input(self) -> None:
+        if self._line_cursor == 0:
+            return
+        self._line_buf = (
+            self._line_buf[: self._line_cursor - 1]
+            + self._line_buf[self._line_cursor :]
+        )
+        self._line_cursor -= 1
+        self._reset_history_navigation()
+
+    def _delete_input(self) -> None:
+        if self._line_cursor >= len(self._line_buf):
+            return
+        self._line_buf = (
+            self._line_buf[: self._line_cursor]
+            + self._line_buf[self._line_cursor + 1 :]
+        )
+        self._reset_history_navigation()
+
+    def _clear_input(self) -> None:
+        self._line_buf = ""
+        self._line_cursor = 0
+        self._reset_history_navigation()
+
+    def _move_cursor_left(self) -> None:
+        self._line_cursor = max(self._line_cursor - 1, 0)
+
+    def _move_cursor_right(self) -> None:
+        self._line_cursor = min(self._line_cursor + 1, len(self._line_buf))
+
+    def _move_cursor_home(self) -> None:
+        self._line_cursor = 0
+
+    def _move_cursor_end(self) -> None:
+        self._line_cursor = len(self._line_buf)
+
+    def _history_commands(self) -> list[str]:
+        return [handle.command for handle in self._handles]
+
+    def _replace_prompt_input(self, text: str) -> None:
+        if self._fd is None:
+            return
+        try:
+            os.write(self._fd, b"\x15")
+            if text:
+                os.write(self._fd, text.encode("utf-8"))
+        except OSError:
+            return
+        self._line_buf = text
+        self._line_cursor = len(text)
+
+    def set_prompt_input(self, text: str) -> bool:
+        if self._fd is None or not self._running or not self._prompt_is_idle():
+            return False
+        self._replace_prompt_input(text)
+        self.focus()
+        return True
+
+    def agent_context(self) -> str:
+        return self._last_context or self._build_context(self._line_buf)
+
+    def _navigate_history(self, step: int) -> bool:
+        commands = self._history_commands()
+        if not commands:
+            return False
+        if self._history_nav_index is None:
+            self._history_nav_draft = self._line_buf
+            self._history_nav_index = len(commands)
+        next_index = min(max(self._history_nav_index + step, 0), len(commands))
+        self._history_nav_index = next_index
+        if next_index == len(commands):
+            self._replace_prompt_input(self._history_nav_draft)
+        else:
+            self._replace_prompt_input(commands[next_index])
+        return True
+
+    def _track_submitted_command(self, command: str) -> CommandHandle:
+        handle = CommandHandle(handle_id=self._next_handle_id, command=command)
+        self._next_handle_id += 1
+        self._handles.append(handle)
+        self._pending_handles.append(handle)
+        return handle
+
+    def _build_context(self, command: str, output: str = "") -> str:
+        context = (
+            f"User: {self._shell_user}\n"
+            f"Cwd: {self._shell_cwd}\n"
+            f"Last command: {command}"
+        )
+        if output:
+            context += f"\nOutput:\n{output}"
+        return context
+
+    def _emit_command_executed(self, handle: CommandHandle, intercepted: bool = False) -> None:
+        self.post_message(
+            TerminalView.CommandExecuted(
+                handle.exit_code if handle.exit_code is not None else -1,
+                handle.user,
+                handle.cwd,
+                handle.command,
+                handle.output,
+                intercepted=intercepted,
+            )
+        )
+
+    def _complete_intercepted_command(self, command: str, query: str, mode: str) -> None:
+        handle = CommandHandle(
+            handle_id=self._next_handle_id,
+            command=command,
+            exit_code=0,
+            user=self._shell_user,
+            cwd=self._shell_cwd,
+            started=True,
+            completed=True,
+        )
+        self._next_handle_id += 1
+        self._handles.append(handle)
+        self._last_context = self._build_context(command)
+        self._emit_command_executed(handle, intercepted=True)
+        self.post_message(
+            TerminalView.AgentQueried(query, self._last_context, mode=mode)
+        )
+
+    def _bind_active_handle(self) -> None:
+        if self._active_handle is None and self._pending_handles:
+            self._active_handle = self._pending_handles.popleft()
+            self._active_handle.started = True
+
+    def _prompt_is_idle(self) -> bool:
+        return not self._capturing and not self._command_started
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -191,6 +342,9 @@ class TerminalView(Widget):
                 "TERM": "xterm-256color",
                 "COLUMNS": str(cols),
                 "LINES": str(rows),
+                "HISTFILE": "/dev/null",
+                "HISTSIZE": "0",
+                "HISTFILESIZE": "0",
                 "PROMPT_COMMAND": _LTERM_PROMPT_CMD,
                 "PS0": _LTERM_PS0,
             }
@@ -284,6 +438,7 @@ class TerminalView(Widget):
                 self._output_buf = bytearray()
                 self._capturing = True
                 self._command_started = True
+                self._bind_active_handle()
             elif osc_body.startswith(b"9999;"):
                 self._capturing = False
                 if self._command_started:
@@ -302,22 +457,34 @@ class TerminalView(Widget):
 
     def _handle_command_end(self, metadata: bytes) -> None:
         text = metadata.decode("utf-8", errors="replace")
-        parts = text.split("\x1f", 3)
-        if len(parts) < 4:
+        parts = text.split("\x1f", 2)
+        if len(parts) < 3:
             return
         try:
             exit_code = int(parts[0])
         except ValueError:
             exit_code = -1
-        user, cwd, command = parts[1], parts[2], parts[3]
-        if not command.strip():
-            return
+        user, cwd = parts[1], parts[2]
         clean_out = (
             _strip_ansi(bytes(self._output_buf))
             .decode("utf-8", errors="replace")
             .replace("\r", "")
             .strip()
         )
+        self._shell_user = user
+        self._shell_cwd = cwd
+        handle = self._active_handle
+        command = handle.command if handle is not None else ""
+        if not command.strip():
+            return
+        if handle is not None:
+            handle.output = clean_out
+            handle.exit_code = exit_code
+            handle.user = user
+            handle.cwd = cwd
+            handle.completed = True
+            self._active_handle = None
+        self._last_context = self._build_context(command, clean_out)
         self.app.call_from_thread(
             self.post_message,
             TerminalView.CommandExecuted(exit_code, user, cwd, command, clean_out),
@@ -387,10 +554,79 @@ class TerminalView(Widget):
                 self.refresh()
                 event.stop()
                 return
+        if self._prompt_is_idle() and event.key == "up":
+            self._navigate_history(-1)
+            event.stop()
+            event.prevent_default()
+            return
+        if self._prompt_is_idle() and event.key == "down":
+            self._navigate_history(1)
+            event.stop()
+            event.prevent_default()
+            return
+
+        if event.character and event.key not in _SPECIAL_KEYS:
+            self._insert_input(event.character)
+        elif event.key == "backspace":
+            self._backspace_input()
+        elif event.key == "delete":
+            self._delete_input()
+        elif event.key == "left":
+            self._move_cursor_left()
+        elif event.key == "right":
+            self._move_cursor_right()
+        elif event.key == "home":
+            self._move_cursor_home()
+        elif event.key == "end":
+            self._move_cursor_end()
+        elif event.key == "ctrl+u":
+            self._clear_input()
+
         self._scroll_offset = 0
         data: Optional[bytes] = _SPECIAL_KEYS.get(event.key)
         if data is None and event.character:
             data = event.character.encode("utf-8")
+        if event.key == "enter":
+            submitted_line = self._line_buf
+            submitted = submitted_line.strip()
+            if submitted == "bye":
+                self._reset_line_state()
+                self._running = False
+                if self._pid is not None:
+                    try:
+                        os.kill(self._pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                if self._fd is not None:
+                    try:
+                        os.close(self._fd)
+                    except OSError:
+                        pass
+                    self._fd = None
+                self._on_shell_exit()
+                event.stop()
+                event.prevent_default()
+                return
+            if submitted.startswith("--") or submitted.startswith("??"):
+                prefix = submitted[:2]
+                body = submitted[2:].strip()
+                if body:
+                    try:
+                        os.write(self._fd, b"\x15")
+                    except OSError:
+                        pass
+                    self._reset_line_state()
+                    self._complete_intercepted_command(
+                        submitted,
+                        body,
+                        mode="command" if prefix == "??" else "ask",
+                    )
+                    event.stop()
+                    event.prevent_default()
+                    return
+            self._reset_line_state()
+            if submitted:
+                self._track_submitted_command(submitted)
         if data is not None:
             try:
                 os.write(self._fd, data)
@@ -432,9 +668,15 @@ class TerminalView(Widget):
             for i, (is_hist, row_data) in enumerate(all_rows):
                 for col in range(screen.columns):
                     char = row_data.get(col, default) if is_hist else row_data[col]  # type: ignore[union-attr,index]
-                    result.append(char.data, _cached_style(
-                        char.fg, char.bg, char.bold, char.italics,
-                        char.underscore, char.blink, char.reverse, char.strikethrough,
+                    result.append(char.data, Style(
+                        color=_resolve_color(char.fg),
+                        bgcolor=_resolve_color(char.bg),
+                        bold=char.bold,
+                        italic=char.italics,
+                        underline=char.underscore,
+                        blink=char.blink,
+                        reverse=char.reverse,
+                        strike=char.strikethrough,
                     ))
                 if i < len(all_rows) - 1:
                     result.append("\n")
@@ -443,9 +685,15 @@ class TerminalView(Widget):
                 row_buf = screen.buffer[row]
                 for col in range(screen.columns):
                     char = row_buf[col]
-                    style = _cached_style(
-                        char.fg, char.bg, char.bold, char.italics,
-                        char.underscore, char.blink, char.reverse, char.strikethrough,
+                    style = Style(
+                        color=_resolve_color(char.fg),
+                        bgcolor=_resolve_color(char.bg),
+                        bold=char.bold,
+                        italic=char.italics,
+                        underline=char.underscore,
+                        blink=char.blink,
+                        reverse=char.reverse,
+                        strike=char.strikethrough,
                     )
                     if row == cy and col == cx:
                         style = style + Style(reverse=True)
