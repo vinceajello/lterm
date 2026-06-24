@@ -67,6 +67,7 @@ class CommandHandle:
     cwd: str = ""
     started: bool = False
     completed: bool = False
+    intercepted: bool = False
 
 def _strip_ansi(data: bytes) -> bytes:
     return _ANSI_ESCAPE_RE.sub(b"", data)
@@ -212,6 +213,34 @@ class TerminalView(Widget):
     def _history_commands(self) -> list[str]:
         return [handle.command for handle in self._handles]
 
+    def history_snapshot(self, limit: int | None = None) -> list[dict[str, object]]:
+        handles = self._handles if limit is None else self._handles[-max(limit, 0) :]
+        items: list[dict[str, object]] = []
+        for handle in handles:
+            kind = "shell_command"
+            if handle.intercepted and handle.command.startswith("--"):
+                kind = "agent_question"
+            elif handle.intercepted and handle.command.startswith("??"):
+                kind = "agent_command_explanation"
+            elif handle.intercepted:
+                kind = "agent_query"
+
+            items.append(
+                {
+                    "handle_id": handle.handle_id,
+                    "kind": kind,
+                    "command": handle.command,
+                    "output": handle.output,
+                    "exit_code": handle.exit_code,
+                    "user": handle.user,
+                    "cwd": handle.cwd,
+                    "started": handle.started,
+                    "completed": handle.completed,
+                    "intercepted": handle.intercepted,
+                }
+            )
+        return items
+
     def _replace_prompt_input(self, text: str) -> None:
         if self._fd is None:
             return
@@ -287,6 +316,7 @@ class TerminalView(Widget):
             cwd=self._shell_cwd,
             started=True,
             completed=True,
+            intercepted=True,
         )
         self._next_handle_id += 1
         self._handles.append(handle)

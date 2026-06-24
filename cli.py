@@ -1,10 +1,10 @@
-import os
 import threading
 import time
+from typing import Iterator
 
 from textual.app import App, ComposeResult
 
-from src.assistant.agent import ask, ask_command, ask_error, generate_suggestions
+from src.assistant.agent import AgentEvent, ask, ask_command, ask_error, generate_suggestions
 from src.ui.header import StatusHeader
 from src.ui.terminal import TerminalView
 from src.ui.bottompanel import BottomPanel, SuggestionBar, TextArea
@@ -52,6 +52,10 @@ class TerminalApp(App):
 
     def on_terminal_view_command_executed(self, event: TerminalView.CommandExecuted) -> None:
         ok = event.exit_code == 0
+        if ok and event.command.strip() == "clear":
+            self.query_one(SuggestionBar).clear_suggestions()
+            self.query_one(TextArea).clear()
+            return
         if ok:
             icon = "✓ OK"
             lines = [
@@ -92,11 +96,20 @@ class TerminalApp(App):
 
     # AGENT
 
-    def _render_agent_result(self, header: str, answer: str, suggestions: list[str]) -> None:
+    def _render_agent_result(
+        self,
+        header: str,
+        answer: str,
+        suggestions: list[str],
+        tool_lines: list[str],
+    ) -> None:
         text_area = self.query_one(TextArea)
         suggestion_bar = self.query_one(SuggestionBar)
 
         lines = [header, ""]
+        if tool_lines:
+            lines.extend(tool_lines)
+            lines.append("")
         lines.append(answer or "No answer returned.")
 
         text_area.clear()
@@ -105,23 +118,42 @@ class TerminalApp(App):
         for suggestion in suggestions:
             suggestion_bar.add_suggestion(suggestion)
 
-    def _stream_agent_response(self, header: str, chunks_iter) -> None:
+    def _format_tool_line(self, event: AgentEvent) -> str:
+        arguments = (event.meta or {}).get("arguments", {})
+        if not arguments:
+            return f"Tool: {event.content}"
+        parts = ", ".join(f"{key}={value!r}" for key, value in arguments.items())
+        return f"Tool: {event.content}({parts})"
+
+    def _stream_agent_response(self, header: str, events_iter: Iterator[AgentEvent | str]) -> None:
         text_area = self.query_one(TextArea)
         suggestion_bar = self.query_one(SuggestionBar)
 
         def run() -> None:
             answer = ""
             last_update = 0.0
+            tool_lines: list[str] = []
 
             def flush() -> None:
                 text_area.clear()
-                text_area.write(f"{header}\n\n{answer or 'Thinking...'}")
+                lines = [header, ""]
+                if tool_lines:
+                    lines.extend(tool_lines)
+                    lines.append("")
+                lines.append(answer or "Thinking...")
+                text_area.write("\n".join(lines))
 
             try:
-                for chunk in chunks_iter:
-                    answer += chunk
+                for event in events_iter:
+                    if isinstance(event, str):
+                        answer += event
+                    elif event.kind == "tool":
+                        tool_lines.append(self._format_tool_line(event))
+                    elif event.kind == "text":
+                        answer += event.content
+
                     now = time.monotonic()
-                    if now - last_update >= 0.1:
+                    if now - last_update >= 0.1 or (not answer and tool_lines):
                         self.call_from_thread(flush)
                         last_update = now
                 answer = answer.strip()
@@ -139,6 +171,7 @@ class TerminalApp(App):
                 header,
                 answer,
                 suggestions,
+                tool_lines,
             )
 
         suggestion_bar.clear_suggestions()
@@ -153,21 +186,17 @@ class TerminalApp(App):
 
     def _answer_agent_question(self, query: str, context: str) -> None:
         header = f"Question: {query}"
-        self._stream_agent_response(header, ask(query, context=context))
+        history = self.query_one(TerminalView).history_snapshot(limit=50)
+        self._stream_agent_response(header, ask(query, context=context, history=history))
 
     def _explain_agent_command(self, command: str, context: str) -> None:
         header = f"Explanation: {command}"
-        self._stream_agent_response(header, ask_command(command, context=context))
+        history = self.query_one(TerminalView).history_snapshot(limit=50)
+        self._stream_agent_response(header, ask_command(command, context=context, history=history))
 
     def _explain_agent_error(self, command: str, error_info: str) -> None:
         header = f"Error Help: {command}"
         self._stream_agent_response(header, ask_error(error_info))
-
-    # TODO: agent must have function calling capabilities
-
-    # TODO: TOOL: retrieve history and check for last intents
-
-    # TODO: TOOL: retrieve mandb documentation for command
 
     # TODO: TOOL: web search for documentation
 
