@@ -1,25 +1,20 @@
 from __future__ import annotations
 
-import fcntl
 import os
-import pty
-import re
-import select
-import signal
-import struct
-import termios
 import threading
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
 import pyte
-from collections import deque
 from rich.style import Style
 from rich.text import Text
-from src.ui.bottompanel import TextArea
 from textual import events
 from textual.message import Message
 from textual.widget import Widget
+
+from src.ui.bottompanel import TextArea
+from src.ui.terminal_backend import CommandEndEvent, OscParser, PtyManager
 
 _SPECIAL_KEYS: dict[str, bytes] = {
     "enter": b"\r",
@@ -38,24 +33,6 @@ _SPECIAL_KEYS: dict[str, bytes] = {
     "delete": b"\x1b[3~",
 }
 
-_ANSI_ESCAPE_RE = re.compile(
-    rb"\x1b(?:"
-    rb"\[[0-?]*[ -/]*[@-~]"
-    rb"|\][^\x07]*\x07"
-    rb"|[PX^_][^\x1b]*\x1b\\"
-    rb"|[@-_]"
-    rb"|[^\x1b]"
-    rb")",
-    re.DOTALL,
-)
-
-_LTERM_PROMPT_CMD = (
-    r"__lterm_e=$?;"
-    r" printf '\033]9999;%d\037%s\037%s\007'"
-    " \"$__lterm_e\" \"$USER\" \"$PWD\""
-)
-_LTERM_PS0 = "\033]9998;\007"
-
 
 @dataclass(slots=True)
 class CommandHandle:
@@ -69,8 +46,6 @@ class CommandHandle:
     completed: bool = False
     intercepted: bool = False
 
-def _strip_ansi(data: bytes) -> bytes:
-    return _ANSI_ESCAPE_RE.sub(b"", data)
 
 class ScrollbackScreen(pyte.Screen):
     """pyte.Screen with a scrollback history buffer."""
@@ -85,6 +60,7 @@ class ScrollbackScreen(pyte.Screen):
         if top == 0 and self.cursor.y == bottom:
             self._history.append(dict(self.buffer[top]))
         super().index()
+
 
 def _resolve_color(color: str) -> Optional[str]:
     _named = {
@@ -102,6 +78,7 @@ def _resolve_color(color: str) -> Optional[str]:
     if color.isdigit():
         return f"color({color})"
     return _named.get(color)
+
 
 class TerminalView(Widget):
     """A bare-minimum VT100 terminal emulator widget powered by pyte."""
@@ -130,20 +107,16 @@ class TerminalView(Widget):
     def __init__(self, shell: str = "/bin/bash", **kwargs) -> None:
         super().__init__(**kwargs)
         self._shell = shell
-        self._fd: Optional[int] = None
-        self._pid: Optional[int] = None
         self._screen: Optional[pyte.Screen] = None
         self._stream: Optional[pyte.ByteStream] = None
-        self._thread: Optional[threading.Thread] = None
-        self._running = False
         self._scroll_offset: int = 0
         self._render_lock = threading.Lock()
         self._rendered: Text = Text()
         self._refresh_pending = False
-        self._raw_buf = bytearray()
-        self._output_buf = bytearray()
-        self._capturing = False
-        self._command_started = False
+        
+        self._pty_manager: Optional[PtyManager] = None
+        self._osc_parser = OscParser(on_command_start=self._bind_active_handle)
+
         self._line_buf = ""
         self._line_cursor = 0
         self._history_nav_index: Optional[int] = None
@@ -242,19 +215,16 @@ class TerminalView(Widget):
         return items
 
     def _replace_prompt_input(self, text: str) -> None:
-        if self._fd is None:
+        if not self._pty_manager or not self._pty_manager.is_running:
             return
-        try:
-            os.write(self._fd, b"\x15")
-            if text:
-                os.write(self._fd, text.encode("utf-8"))
-        except OSError:
-            return
+        self._pty_manager.write_byte(b"\x15")
+        if text:
+            self._pty_manager.write_byte(text.encode("utf-8"))
         self._line_buf = text
         self._line_cursor = len(text)
 
     def set_prompt_input(self, text: str) -> bool:
-        if self._fd is None or not self._running or not self._prompt_is_idle():
+        if not self._pty_manager or not self._pty_manager.is_running or not self._prompt_is_idle():
             return False
         self._replace_prompt_input(text)
         self.focus()
@@ -332,7 +302,7 @@ class TerminalView(Widget):
             self._active_handle.started = True
 
     def _prompt_is_idle(self) -> bool:
-        return not self._capturing and not self._command_started
+        return not self._osc_parser.is_capturing and not self._osc_parser.is_command_started
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -341,195 +311,93 @@ class TerminalView(Widget):
     def on_mount(self) -> None:
         cols = max(self.size.width or 80, 1)
         rows = max(self.size.height or 24, 1)
-        self._start_shell(cols, rows)
+        
+        self._screen = ScrollbackScreen(cols, rows)
+        self._stream = pyte.ByteStream(self._screen)
+        
+        self._pty_manager = PtyManager(
+            shell=self._shell,
+            cols=cols,
+            rows=rows,
+            on_data=self._on_pty_data,
+            on_exit=self._on_pty_exit
+        )
+        
         self.focus()
 
     def on_unmount(self) -> None:
-        self._running = False
-        if self._pid is not None:
-            try:
-                os.kill(self._pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        if self._fd is not None:
-            try:
-                os.close(self._fd)
-            except OSError:
-                pass
+        if self._pty_manager is not None:
+            self._pty_manager.close()
 
-    # ------------------------------------------------------------------
-    # Shell process
-    # ------------------------------------------------------------------
+    def _on_pty_data(self, data: bytes) -> None:
+        pyte_data, events = self._osc_parser.feed(data)
+        with self._render_lock:
+            if self._stream is not None:
+                self._stream.feed(pyte_data)
+            self._scroll_offset = 0
+            self._rendered = self._build_text()
+        
+        if not self._refresh_pending:
+            self._refresh_pending = True
+            self.app.call_from_thread(self._do_refresh)
 
-    def _start_shell(self, cols: int, rows: int) -> None:
-        self._screen = ScrollbackScreen(cols, rows)
-        self._stream = pyte.ByteStream(self._screen)
-        self._pid, self._fd = pty.fork()
+        for event in events:
+            self._handle_command_end(event)
 
-        if self._pid == 0:  # child
-            env = {
-                **os.environ,
-                "TERM": "xterm-256color",
-                "COLUMNS": str(cols),
-                "LINES": str(rows),
-                "HISTFILE": "/dev/null",
-                "HISTSIZE": "0",
-                "HISTFILESIZE": "0",
-                "PROMPT_COMMAND": _LTERM_PROMPT_CMD,
-                "PS0": _LTERM_PS0,
-            }
-            try:
-                os.execvpe(self._shell, [self._shell], env)
-            except Exception:
-                pass
-            os._exit(1)
-
-        self._resize_pty(cols, rows)
-        self._running = True
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
-
-    def _resize_pty(self, cols: int, rows: int) -> None:
-        if self._fd is not None:
-            fcntl.ioctl(
-                self._fd,
-                termios.TIOCSWINSZ,
-                struct.pack("HHHH", rows, cols, 0, 0),
-            )
-
-    def _read_loop(self) -> None:
-        while self._running:
-            try:
-                r, _, _ = select.select([self._fd], [], [], 0.05)
-                if r:
-                    data = os.read(self._fd, 8192)
-                    if not data:
-                        break
-                    pyte_data = self._process_raw(data)
-                    with self._render_lock:
-                        self._stream.feed(pyte_data)
-                        self._scroll_offset = 0
-                        self._rendered = self._build_text()
-                    if not self._refresh_pending:
-                        self._refresh_pending = True
-                        self.app.call_from_thread(self._do_refresh)
-            except OSError:
-                break
-        self._running = False
+    def _on_pty_exit(self) -> None:
         self.app.call_from_thread(self._on_shell_exit)
 
     def _do_refresh(self) -> None:
         self._refresh_pending = False
         self.refresh()
 
-    def _process_raw(self, data: bytes) -> bytes:
-        """Strip OSC 9998/9999 shell-integration markers; return bytes for pyte."""
-        self._raw_buf.extend(data)
-        buf = bytes(self._raw_buf)
-        pyte_data = bytearray()
-        pos = 0
-
-        while pos < len(buf):
-            osc_start = buf.find(b"\x1b]", pos)
-            if osc_start == -1:
-                chunk = buf[pos:-1] if buf.endswith(b"\x1b") else buf[pos:]
-                self._raw_buf = bytearray(b"\x1b") if buf.endswith(b"\x1b") else bytearray()
-                pyte_data.extend(chunk)
-                if self._capturing:
-                    self._output_buf.extend(chunk)
-                break
-
-            chunk = buf[pos:osc_start]
-            pyte_data.extend(chunk)
-            if self._capturing:
-                self._output_buf.extend(chunk)
-            pos = osc_start
-
-            bel_pos = buf.find(b"\x07", pos + 2)
-            st_pos = buf.find(b"\x1b\\", pos + 2)
-            if bel_pos == -1 and st_pos == -1:
-                self._raw_buf = bytearray(buf[pos:]) if len(buf) - pos <= 2048 else bytearray()
-                if len(buf) - pos > 2048:
-                    pyte_data.extend(b"\x1b]")
-                    pos += 2
-                    continue
-                break
-
-            if bel_pos != -1 and (st_pos == -1 or bel_pos < st_pos):
-                osc_body = buf[pos + 2 : bel_pos]
-                pos = bel_pos + 1
-                raw_term = b"\x07"
-            else:
-                osc_body = buf[pos + 2 : st_pos]
-                pos = st_pos + 2
-                raw_term = b"\x1b\\"
-
-            if osc_body == b"9998;":
-                self._output_buf = bytearray()
-                self._capturing = True
-                self._command_started = True
-                self._bind_active_handle()
-            elif osc_body.startswith(b"9999;"):
-                self._capturing = False
-                if self._command_started:
-                    self._handle_command_end(osc_body[5:])
-                    self._command_started = False
-                self._output_buf = bytearray()
-            else:
-                seq = b"\x1b]" + osc_body + raw_term
-                pyte_data.extend(seq)
-                if self._capturing:
-                    self._output_buf.extend(seq)
-        else:
-            self._raw_buf = bytearray()
-
-        return bytes(pyte_data)
-
-    def _handle_command_end(self, metadata: bytes) -> None:
-        text = metadata.decode("utf-8", errors="replace")
-        parts = text.split("\x1f", 2)
-        if len(parts) < 3:
-            return
-        try:
-            exit_code = int(parts[0])
-        except ValueError:
-            exit_code = -1
-        user, cwd = parts[1], parts[2]
-        clean_out = (
-            _strip_ansi(bytes(self._output_buf))
-            .decode("utf-8", errors="replace")
-            .replace("\r", "")
-            .strip()
-        )
-        self._shell_user = user
-        self._shell_cwd = cwd
+    def _handle_command_end(self, event: CommandEndEvent) -> None:
+        self._shell_user = event.user
+        self._shell_cwd = event.cwd
+        
         handle = self._active_handle
         command = handle.command if handle is not None else ""
         if not command.strip():
             return
+            
         if handle is not None:
-            handle.output = clean_out
-            handle.exit_code = exit_code
-            handle.user = user
-            handle.cwd = cwd
+            handle.output = event.output
+            handle.exit_code = event.exit_code
+            handle.user = event.user
+            handle.cwd = event.cwd
             handle.completed = True
             self._active_handle = None
-        self._last_context = self._build_context(command, clean_out)
+            
+        self._last_context = self._build_context(command, event.output)
         self.app.call_from_thread(
             self.post_message,
-            TerminalView.CommandExecuted(exit_code, user, cwd, command, clean_out),
+            TerminalView.CommandExecuted(event.exit_code, event.user, event.cwd, command, event.output),
         )
 
     # ------------------------------------------------------------------
     # Events
     # ------------------------------------------------------------------
 
+    def on_paste(self, event: events.Paste) -> None:
+        if not self._pty_manager or not self._pty_manager.is_running:
+            return
+        text = event.text
+        if not text:
+            return
+            
+        if self._prompt_is_idle():
+            single_line_text = text.replace("\r", "").replace("\n", " ")
+            self._insert_input(single_line_text)
+            
+        self._pty_manager.write(text.encode("utf-8"))
+
     def on_resize(self, event: events.Resize) -> None:
         cols, rows = event.size.width, event.size.height
         with self._render_lock:
             if self._screen is not None:
                 self._screen.resize(rows, cols)
-            self._resize_pty(cols, rows)
+            if self._pty_manager is not None:
+                self._pty_manager.resize(cols, rows)
             self._rendered = self._build_text()
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
@@ -551,7 +419,7 @@ class TerminalView(Widget):
             event.stop()
 
     def on_key(self, event: events.Key) -> None:
-        if self._fd is None or not self._running:
+        if not self._pty_manager or not self._pty_manager.is_running:
             return
         if isinstance(self._screen, ScrollbackScreen):
             history_len = len(self._screen._history)
@@ -621,18 +489,8 @@ class TerminalView(Widget):
             submitted = submitted_line.strip()
             if submitted == "bye":
                 self._reset_line_state()
-                self._running = False
-                if self._pid is not None:
-                    try:
-                        os.kill(self._pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                if self._fd is not None:
-                    try:
-                        os.close(self._fd)
-                    except OSError:
-                        pass
-                    self._fd = None
+                self._pty_manager.close()
+                self._pty_manager = None
                 self._on_shell_exit()
                 event.stop()
                 event.prevent_default()
@@ -641,10 +499,7 @@ class TerminalView(Widget):
                 prefix = submitted[:2]
                 body = submitted[2:].strip()
                 if body:
-                    try:
-                        os.write(self._fd, b"\x15")
-                    except OSError:
-                        pass
+                    self._pty_manager.write_byte(b"\x15")
                     self._reset_line_state()
                     self._complete_intercepted_command(
                         submitted,
@@ -658,10 +513,7 @@ class TerminalView(Widget):
             if submitted:
                 self._track_submitted_command(submitted)
         if data is not None:
-            try:
-                os.write(self._fd, data)
-            except OSError:
-                pass
+            self._pty_manager.write(data)
             event.stop()
             event.prevent_default()
 
