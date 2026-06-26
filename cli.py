@@ -1,7 +1,7 @@
-import threading
 import time
 from typing import Iterator
 
+from textual import work
 from textual.app import App, ComposeResult
 
 from src.assistant.agent import AgentEvent, ask, ask_command, ask_error, generate_suggestions
@@ -126,58 +126,61 @@ class TerminalApp(App):
         return f"Tool: {event.content}({parts})"
 
     def _stream_agent_response(self, header: str, events_iter: Iterator[AgentEvent | str]) -> None:
-        text_area = self.query_one(TextArea)
         suggestion_bar = self.query_one(SuggestionBar)
-
-        def run() -> None:
-            answer = ""
-            last_update = 0.0
-            tool_lines: list[str] = []
-
-            def flush() -> None:
-                text_area.clear()
-                lines = [header, ""]
-                if tool_lines:
-                    lines.extend(tool_lines)
-                    lines.append("")
-                lines.append(answer or "Thinking...")
-                text_area.write("\n".join(lines))
-
-            try:
-                for event in events_iter:
-                    if isinstance(event, str):
-                        answer += event
-                    elif event.kind == "tool":
-                        tool_lines.append(self._format_tool_line(event))
-                    elif event.kind == "text":
-                        answer += event.content
-
-                    now = time.monotonic()
-                    if now - last_update >= 0.1 or (not answer and tool_lines):
-                        self.call_from_thread(flush)
-                        last_update = now
-                answer = answer.strip()
-                suggestions = generate_suggestions(answer) if answer else []
-            except Exception as exc:
-                self.call_from_thread(
-                    self._render_agent_error,
-                    header,
-                    f"Agent error: {exc}",
-                )
-                return
-
-            self.call_from_thread(
-                self._render_agent_result,
-                header,
-                answer,
-                suggestions,
-                tool_lines,
-            )
+        text_area = self.query_one(TextArea)
 
         suggestion_bar.clear_suggestions()
         text_area.clear()
         text_area.write(f"{header}\n\nThinking...")
-        threading.Thread(target=run, daemon=True).start()
+        
+        self._stream_agent_worker(header, events_iter)
+
+    @work(thread=True)
+    def _stream_agent_worker(self, header: str, events_iter: Iterator[AgentEvent | str]) -> None:
+        text_area = self.query_one(TextArea)
+        answer = ""
+        last_update = 0.0
+        tool_lines: list[str] = []
+
+        def flush() -> None:
+            text_area.clear()
+            lines = [header, ""]
+            if tool_lines:
+                lines.extend(tool_lines)
+                lines.append("")
+            lines.append(answer or "Thinking...")
+            text_area.write("\n".join(lines))
+
+        try:
+            for event in events_iter:
+                if isinstance(event, str):
+                    answer += event
+                elif event.kind == "tool":
+                    tool_lines.append(self._format_tool_line(event))
+                elif event.kind == "text":
+                    answer += event.content
+
+                now = time.monotonic()
+                if now - last_update >= 0.1 or (not answer and tool_lines):
+                    self.call_from_thread(flush)
+                    last_update = now
+            answer = answer.strip()
+            suggestions = generate_suggestions(answer) if answer else []
+        except Exception as exc:
+            self.call_from_thread(
+                self._render_agent_error,
+                header,
+                f"Agent error: {exc}",
+            )
+            return
+
+        self.call_from_thread(
+            self._render_agent_result,
+            header,
+            answer,
+            suggestions,
+            tool_lines,
+        )
 
     def _render_agent_error(self, header: str, message: str) -> None:
         self.query_one(SuggestionBar).clear_suggestions()

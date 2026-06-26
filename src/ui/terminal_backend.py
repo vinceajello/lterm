@@ -8,7 +8,7 @@ import select
 import signal
 import struct
 import termios
-import threading
+import termios
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -160,8 +160,6 @@ class PtyManager:
         self._fd: Optional[int] = None
         self._pid: Optional[int] = None
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-
         self._start(cols, rows)
 
     def _start(self, cols: int, rows: int) -> None:
@@ -187,8 +185,6 @@ class PtyManager:
 
         self.resize(cols, rows)
         self._running = True
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
 
     def resize(self, cols: int, rows: int) -> None:
         if self._fd is not None:
@@ -222,7 +218,7 @@ class PtyManager:
                 pass
             self._fd = None
 
-    def _read_loop(self) -> None:
+    def read_loop(self) -> None:
         while self._running:
             try:
                 if self._fd is None:

@@ -9,7 +9,7 @@ from typing import Optional
 import pyte
 from rich.style import Style
 from rich.text import Text
-from textual import events
+from textual import events, work
 from textual.message import Message
 from textual.widget import Widget
 
@@ -322,8 +322,14 @@ class TerminalView(Widget):
             on_data=self._on_pty_data,
             on_exit=self._on_pty_exit
         )
+        self._pty_reader_worker()
         
         self.focus()
+
+    @work(thread=True)
+    def _pty_reader_worker(self) -> None:
+        if self._pty_manager is not None:
+            self._pty_manager.read_loop()
 
     def on_unmount(self) -> None:
         if self._pty_manager is not None:
