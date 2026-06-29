@@ -27,10 +27,11 @@ class LTermNativeApp(Gtk.Window):
         # Configurazione Copia/Incolla e scorciatoie da tastiera
         self.terminal.connect("key-press-event", self._on_key_press)
 
-        # Forza la selezione testuale nativa (bypassando la cattura del mouse di Textual)
-        self.terminal.connect("button-press-event", self._force_native_selection)
-        self.terminal.connect("motion-notify-event", self._force_native_selection)
-        self.terminal.connect("button-release-event", self._force_native_selection)
+        # Non forziamo la maschera SHIFT su ogni evento mouse: questo impedirebbe
+        # a Textual (in esecuzione dentro VTE) di ricevere gli eventi mouse,
+        # rompendo il drag della ResizeHandle del BottomPanel.
+        # Per la selezione testuale nativa l'utente tiene premuto SHIFT
+        # (comportamento standard di VTE).
 
         # --- Gestione robusta del cursore ---
         try:
@@ -68,12 +69,6 @@ class LTermNativeApp(Gtk.Window):
 
         # Quando l'utente chiude la finestra, chiudiamo l'app correttamente
         self.connect("destroy", Gtk.main_quit)
-
-    def _force_native_selection(self, widget, event):
-        # Aggiunge la maschera SHIFT in modo che VTE esegua sempre la selezione
-        # testuale del terminale e non inoltri l'evento all'app TUI (Textual)
-        event.state |= Gdk.ModifierType.SHIFT_MASK
-        return False
 
     def _on_key_press(self, widget, event):
         ctrl_shift = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
