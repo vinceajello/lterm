@@ -107,7 +107,7 @@ class SuggestionBar(Widget):
         height: 1;
         width: 1fr;
         background: #1e1e2e;
-        margin: 0 0 1 0;
+        margin: 0 0 0 0;
     }
     """
 
