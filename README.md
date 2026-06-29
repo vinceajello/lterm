@@ -26,6 +26,18 @@
 | `-- [question]` | **Ask** | Ask a question in plain English to receive guidance and recommended commands. |
 | `?? [command]` | **Explain** | Get an instant, detailed breakdown of exactly what a specific command does before you run it. |
 
+## Configuration
+
+```export OPENAI_API_KEY=sk-your-openai-api-key```
+
+## How to run
+
+To use from another shell: ```uv run cli.py```
+
+To use from a dedicated app: ```uv run app.py```
+
+I will release a prebuilt executable ASAP
+
 ## A Core Philosophy: You Control the Enter Key
 
 > ⚠️ **Safety First:** A core design decision behind LTerm is to never let the agent execute any command without human intervention. LTerm is not an LLM-based automation tool; its agent acts purely as a advisor, leaving the final decision entirely to you.
