@@ -9,3 +9,8 @@ dependencies = [
     "pyte>=0.8.0",
     "textual>=8.2.7",
 ]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.21.0",
+]
