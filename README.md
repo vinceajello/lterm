@@ -30,11 +30,15 @@
 
 ```export OPENAI_API_KEY=sk-your-openai-api-key```
 
+I will add a configuration panel inside the app itself in a future release
+
 ## How to run
 
 To use from another shell: ```uv run cli.py```
 
 To use from a dedicated app: ```uv run app.py```
+
+### Or use the executables in [releases](https://github.com/vinceajello/lterm/releases)
 
 I will release a prebuilt executable ASAP
 
