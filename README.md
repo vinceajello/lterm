@@ -40,8 +40,6 @@ To use from a dedicated app: ```uv run app.py```
 
 ### Or use the executables in [releases](https://github.com/vinceajello/lterm/releases)
 
-I will release a prebuilt executable ASAP
-
 ## A Core Philosophy: You Control the Enter Key
 
 > ⚠️ **Safety First:** A core design decision behind LTerm is to never let the agent execute any command without human intervention. LTerm is not an LLM-based automation tool; its agent acts purely as a advisor, leaving the final decision entirely to you.
