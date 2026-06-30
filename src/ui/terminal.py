@@ -113,7 +113,11 @@ class TerminalView(Widget):
         self._render_lock = threading.Lock()
         self._rendered: Text = Text()
         self._refresh_pending = False
-        
+        # Cache delle righe già renderizzate (senza highlight del cursore).
+        # Chiave = indice riga, valore = Text base. Invalidata su resize/scroll.
+        self._row_cache: dict[int, Text] = {}
+        self._last_cursor_row: int = -1
+
         self._pty_manager: Optional[PtyManager] = None
         self._osc_parser = OscParser(on_command_start=self._bind_active_handle)
 
@@ -400,6 +404,8 @@ class TerminalView(Widget):
     def on_resize(self, event: events.Resize) -> None:
         cols, rows = event.size.width, event.size.height
         with self._render_lock:
+            self._row_cache.clear()
+            self._last_cursor_row = -1
             if self._screen is not None:
                 self._screen.resize(rows, cols)
             if self._pty_manager is not None:
@@ -409,6 +415,7 @@ class TerminalView(Widget):
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         if isinstance(self._screen, ScrollbackScreen):
             with self._render_lock:
+                self._row_cache.clear()
                 self._scroll_offset = min(
                     self._scroll_offset + 3, len(self._screen._history)
                 )
@@ -419,6 +426,7 @@ class TerminalView(Widget):
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         if isinstance(self._screen, ScrollbackScreen):
             with self._render_lock:
+                self._row_cache.clear()
                 self._scroll_offset = max(self._scroll_offset - 3, 0)
                 self._rendered = self._build_text()
             self.refresh()
@@ -432,6 +440,7 @@ class TerminalView(Widget):
             half = max((self._screen.lines) // 2, 1)
             if event.key == "shift+up":
                 with self._render_lock:
+                    self._row_cache.clear()
                     self._scroll_offset = min(self._scroll_offset + 1, history_len)
                     self._rendered = self._build_text()
                 self.refresh()
@@ -439,6 +448,7 @@ class TerminalView(Widget):
                 return
             elif event.key == "shift+down":
                 with self._render_lock:
+                    self._row_cache.clear()
                     self._scroll_offset = max(self._scroll_offset - 1, 0)
                     self._rendered = self._build_text()
                 self.refresh()
@@ -446,6 +456,7 @@ class TerminalView(Widget):
                 return
             elif event.key == "shift+pageup":
                 with self._render_lock:
+                    self._row_cache.clear()
                     self._scroll_offset = min(self._scroll_offset + half, history_len)
                     self._rendered = self._build_text()
                 self.refresh()
@@ -453,6 +464,7 @@ class TerminalView(Widget):
                 return
             elif event.key == "shift+pagedown":
                 with self._render_lock:
+                    self._row_cache.clear()
                     self._scroll_offset = max(self._scroll_offset - half, 0)
                     self._rendered = self._build_text()
                 self.refresh()
@@ -533,6 +545,37 @@ class TerminalView(Widget):
     # Rendering
     # ------------------------------------------------------------------
 
+    def _build_row_text(
+        self,
+        row_data: object,
+        columns: int,
+        default: object,
+        cursor_col: int = -1,
+    ) -> Text:
+        """Costruisce il Text di una singola riga.
+
+        Se *cursor_col* >= 0, la cella corrispondente riceve il reverse-video.
+        Usa ``.get(col, default)`` che funziona sia per il buffer pyte
+        (StaticDefaultDict) sia per le righe di history (dict plain).
+        """
+        row_text = Text(end="", no_wrap=True, overflow="fold")
+        for col in range(columns):
+            char = row_data.get(col, default)  # type: ignore[union-attr]
+            style = Style(
+                color=_resolve_color(char.fg),
+                bgcolor=_resolve_color(char.bg),
+                bold=char.bold,
+                italic=char.italics,
+                underline=char.underscore,
+                blink=char.blink,
+                reverse=char.reverse,
+                strike=char.strikethrough,
+            )
+            if col == cursor_col:
+                style = style + Style(reverse=True)
+            row_text.append(char.data, style)
+        return row_text
+
     def _build_text(self) -> Text:
         """Build a Rich Text from the current screen state. Call under _render_lock."""
         screen = self._screen
@@ -541,53 +584,65 @@ class TerminalView(Widget):
         result = Text(end="", no_wrap=True, overflow="fold")
         offset = self._scroll_offset
         cx, cy = screen.cursor.x, screen.cursor.y
+        default = screen.default_char
 
         if offset > 0 and isinstance(screen, ScrollbackScreen):
+            # Scrollback view: le righe di history non hanno tracking dirty,
+            # vengono ricostruite ogni volta; le righe dello screen usano la cache.
             history = screen._history
             num_hist = min(offset, len(history), screen.lines)
             hist_start = max(len(history) - offset, 0)
             hist_rows = list(history)[hist_start : hist_start + num_hist]
             num_screen = screen.lines - num_hist
-            default = screen.default_char
             all_rows: list[tuple[bool, object]] = (
                 [(True, h) for h in hist_rows]
                 + [(False, screen.buffer[r]) for r in range(num_screen)]
             )
             for i, (is_hist, row_data) in enumerate(all_rows):
-                for col in range(screen.columns):
-                    char = row_data.get(col, default) if is_hist else row_data[col]  # type: ignore[union-attr,index]
-                    result.append(char.data, Style(
-                        color=_resolve_color(char.fg),
-                        bgcolor=_resolve_color(char.bg),
-                        bold=char.bold,
-                        italic=char.italics,
-                        underline=char.underscore,
-                        blink=char.blink,
-                        reverse=char.reverse,
-                        strike=char.strikethrough,
-                    ))
+                if is_hist:
+                    result.append(self._build_row_text(row_data, screen.columns, default))
+                else:
+                    screen_row = i - num_hist
+                    row_text = self._row_cache.get(screen_row)
+                    if row_text is None:
+                        row_text = self._build_row_text(row_data, screen.columns, default)
+                        self._row_cache[screen_row] = row_text
+                    result.append(row_text)
                 if i < len(all_rows) - 1:
                     result.append("\n")
-        else:
-            for row in range(screen.lines):
-                row_buf = screen.buffer[row]
-                for col in range(screen.columns):
-                    char = row_buf[col]
-                    style = Style(
-                        color=_resolve_color(char.fg),
-                        bgcolor=_resolve_color(char.bg),
-                        bold=char.bold,
-                        italic=char.italics,
-                        underline=char.underscore,
-                        blink=char.blink,
-                        reverse=char.reverse,
-                        strike=char.strikethrough,
-                    )
-                    if row == cy and col == cx:
-                        style = style + Style(reverse=True)
-                    result.append(char.data, style=style)
-                if row < screen.lines - 1:
-                    result.append("\n")
+            # Evita che dirty cresca senza bound mentre si è in scrollback.
+            screen.dirty.clear()
+            return result
+
+        # Path normale (offset == 0): rebuild incrementale tramite screen.dirty.
+        dirty = set(screen.dirty)
+        # La riga del cursore va sempre ricostruita (highlight reverse-video)
+        # insieme alla precedente riga del cursore (per rimuovere l'highlight stale).
+        dirty.add(cy)
+        if self._last_cursor_row != cy and 0 <= self._last_cursor_row < screen.lines:
+            dirty.add(self._last_cursor_row)
+        self._last_cursor_row = cy
+
+        for row in range(screen.lines):
+            if row == cy:
+                # Riga del cursore: sempre fresca, con highlight; non si cachea
+                # la versione col cursore (verrebbe invalidata al prossimo frame).
+                row_text = self._build_row_text(
+                    screen.buffer[row], screen.columns, default, cursor_col=cx
+                )
+            elif row in dirty:
+                row_text = self._build_row_text(screen.buffer[row], screen.columns, default)
+                self._row_cache[row] = row_text
+            else:
+                row_text = self._row_cache.get(row)
+                if row_text is None:
+                    row_text = self._build_row_text(screen.buffer[row], screen.columns, default)
+                    self._row_cache[row] = row_text
+            result.append(row_text)
+            if row < screen.lines - 1:
+                result.append("\n")
+
+        screen.dirty.clear()
         return result
 
     def render(self) -> Text:
