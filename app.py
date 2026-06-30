@@ -2,7 +2,7 @@ import os
 import sys
 from pathlib import Path
 
-# Tentativo di importare le librerie GTK, VTE e GDK
+
 try:
     import gi
     gi.require_version('Gtk', '3.0')
@@ -10,9 +10,6 @@ try:
     from gi.repository import Gtk, Vte, GLib, Gdk
 except ImportError as e:
     print(f"\n[!] ERRORE: Mancano le librerie di sistema per l'interfaccia nativa. Dettagli: {e}")
-    print("Per installarle su Ubuntu/Debian, esegui questo comando:")
-    print("sudo apt update && sudo apt install python3-gi gir1.2-vte-2.91")
-    sys.exit(1)
 
 class LTermNativeApp(Gtk.Window):
     def __init__(self, command_path: str):
@@ -46,8 +43,18 @@ class LTermNativeApp(Gtk.Window):
         # Aggiungiamo il terminale alla finestra GTK
         self.add(self.terminal)
 
-        # Avviamo il processo python (cli.py) all'interno del widget terminale
-        cmd = [sys.executable, command_path]
+        # Avviamo il processo python (cli.py) all'interno del widget terminale.
+        # Quando l'app è distribuita con PyInstaller, sys.executable punta al
+        # binario frozen (lterm) e non a un interprete Python: in quel caso
+        # lanciamo il companion executable "lterm-cli" generato dal build script.
+        if hasattr(sys, "_MEIPASS"):
+            cli_bin = Path(sys._MEIPASS) / "lterm-cli"
+            if not cli_bin.exists():
+                print(f"Errore: companion executable non trovato: {cli_bin}")
+                sys.exit(1)
+            cmd = [str(cli_bin)]
+        else:
+            cmd = [sys.executable, command_path]
         child_env = {**os.environ, "LTERM_NATIVE": "1"}
         envv = [f"{key}={value}" for key, value in child_env.items()]
 
@@ -87,8 +94,14 @@ class LTermNativeApp(Gtk.Window):
         return False
 
 def main():
-    # Otteniamo il percorso assoluto di cli.py
-    app_dir = Path(__file__).resolve().parent
+    # Risoluzione del percorso di cli.py.
+    # In un build PyInstaller --onefile i file sono estratti in una cartella
+    # temporanea esposta tramite sys._MEIPASS; in sviluppo si usa la cartella
+    # accanto a questo script.
+    if hasattr(sys, "_MEIPASS"):
+        app_dir = Path(sys._MEIPASS)
+    else:
+        app_dir = Path(__file__).resolve().parent
     cli_path = app_dir / "cli.py"
 
     if not cli_path.exists():
