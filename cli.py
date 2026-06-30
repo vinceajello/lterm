@@ -44,31 +44,29 @@ class TerminalApp(App):
         self.query_one(TextArea).write("use '?? <command>' to get an explanation of a command.")
         self.query_one(TextArea).write("use 'exit' or 'bye' to exit the terminal.")
         self.query_one(SuggestionBar).add_suggestion("mkdir")
+        self._set_bottom_panel_visible(False)
 
     def on_suggestion_bar_pressed(self, event: SuggestionBar.Pressed) -> None:
         terminal = self.query_one(TerminalView)
         terminal.set_prompt_input(event.text)
         self._explain_agent_command(event.text, terminal.agent_context())
 
+    def _set_bottom_panel_visible(self, visible: bool) -> None:
+        """Show or hide the bottom dock."""
+        self.query_one("#bottom-dock").display = visible
+
     def on_terminal_view_command_executed(self, event: TerminalView.CommandExecuted) -> None:
         ok = event.exit_code == 0
         if ok and event.command.strip() == "clear":
             self.query_one(SuggestionBar).clear_suggestions()
             self.query_one(TextArea).clear()
+            self._set_bottom_panel_visible(False)
             return
         if ok:
-            icon = "✓ OK"
-            lines = [
-                icon,
-                f"  Current User: {event.user}",
-                f"  Current Dir:  {event.cwd}",
-                f"  Last Command: {event.command}",
-            ]
-            if event.output:
-                lines.append(f"  Output: {event.output}")
             self.query_one(TextArea).clear()
-            self.query_one(TextArea).write("\n".join(lines))
+            self._set_bottom_panel_visible(False)
         if not ok:
+            self._set_bottom_panel_visible(True)
             error_info = (
                 f"✗ ERROR\n"
                 f"  Current User: {event.user}\n"
@@ -91,6 +89,7 @@ class TerminalApp(App):
         if event.context:
             lines.append("")
             lines.append(event.context)
+        self._set_bottom_panel_visible(True)
         self.query_one(TextArea).clear()
         self.query_one(TextArea).write("\n".join(lines))
 
@@ -129,6 +128,7 @@ class TerminalApp(App):
         suggestion_bar = self.query_one(SuggestionBar)
         text_area = self.query_one(TextArea)
 
+        self._set_bottom_panel_visible(True)
         suggestion_bar.clear_suggestions()
         text_area.clear()
         text_area.write(f"{header}\n\nThinking...")
@@ -185,6 +185,7 @@ class TerminalApp(App):
     def _render_agent_error(self, header: str, message: str) -> None:
         self.query_one(SuggestionBar).clear_suggestions()
         self.query_one(TextArea).clear()
+        self._set_bottom_panel_visible(True)
         self.query_one(TextArea).write(f"{header}\n\n{message}")
 
     def _answer_agent_question(self, query: str, context: str) -> None:
